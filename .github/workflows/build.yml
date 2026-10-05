@@ -1,0 +1,254 @@
+# Builds the rootless NoFlashGPT deb on a Linux runner, no Mac needed.
+# The deb is published under Releases (and Actions -> run -> Artifacts).
+#
+# Self-contained: this one file is everything CI needs, so it can be created
+# straight from the GitHub web editor at .github/workflows/.
+#
+# Same setup that ended up working for WhatAMess: ldid from Procursus (it is
+# not an apt package), a Linux toolchain matched to the runner's CPU and found
+# by locating clang rather than assuming the archive layout, one SDK pulled
+# sparsely, and retries on every network step.
+name: Build and release
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build rootless deb
+    runs-on: ubuntu-22.04
+
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      THEOS_PACKAGE_SCHEME: rootless
+      CURL: curl -fsSL --connect-timeout 15 --max-time 600 --retry 6 --retry-delay 5 --retry-all-errors
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential fakeroot git perl curl zsh unzip rsync xz-utils
+          # Best-effort: not fatal if the distro has dropped them.
+          sudo apt-get install -y --no-install-recommends libtinfo5 || true
+          sudo apt-get install -y --no-install-recommends libncurses5 || true
+
+      - name: Cache ldid
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/tools
+          key: tools-ldid-v1
+
+      - name: Install ldid
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Resolve the current release asset so a moved tag does not break the build.
+          URL=$($CURL -H "Authorization: Bearer $GH_TOKEN" \
+                  https://api.github.com/repos/ProcursusTeam/ldid/releases/latest \
+                | grep -oE 'https://[^"]+/ldid_linux_x86_64' | head -n1 || true)
+          if [ -z "$URL" ]; then
+            echo "API lookup failed, falling back to a pinned release"
+            URL=https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
+          fi
+          echo "Fetching $URL"
+          mkdir -p "$RUNNER_TEMP/tools"
+          $CURL -o "$RUNNER_TEMP/tools/ldid" "$URL"
+          chmod 0755 "$RUNNER_TEMP/tools/ldid"
+
+      - name: Add ldid to PATH
+        run: echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: theos
+          key: theos-ubuntu2204-v1
+
+      - name: Set up Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+
+          retry_clone() {
+            target="$1"; shift
+            for attempt in 1 2 3; do
+              rm -rf "$target"
+              if git clone "$@" "$target"; then return 0; fi
+              echo "clone attempt $attempt failed; retrying in 10s"
+              sleep 10
+            done
+            return 1
+          }
+
+          retry_clone "$THEOS" --recursive --depth 1 https://github.com/theos/theos.git
+
+          # Linux cross toolchain. The release mixes x86_64 and aarch64 builds;
+          # take the one matching this runner, or it extracts fine and then
+          # cannot execute.
+          RAW=$($CURL -H "Authorization: Bearer $GH_TOKEN" \
+                  https://api.github.com/repos/kabiroberai/swift-toolchain-linux/releases/latest \
+                | grep -oE 'https://[^"]+\.tar\.xz' || true)
+          case "$(uname -m)" in
+            aarch64|arm64) ASSETS=$(echo "$RAW" | grep 'aarch64' || true) ;;
+            *)             ASSETS=$(echo "$RAW" | grep -v 'aarch64' || true) ;;
+          esac
+          TC=$(echo "$ASSETS" | grep -m1 'ubuntu22' || true)
+          [ -n "$TC" ] || TC=$(echo "$ASSETS" | grep -m1 'ubuntu20' || true)
+          [ -n "$TC" ] || TC=$(echo "$ASSETS" | head -n1 || true)
+          if [ -z "$TC" ]; then
+            echo "API lookup failed, falling back to a pinned toolchain"
+            TC=https://github.com/kabiroberai/swift-toolchain-linux/releases/download/v2.2.0/swift-5.5-ubuntu20.04.tar.xz
+          fi
+          echo "Host arch: $(uname -m)"
+          echo "Toolchain: $TC"
+          $CURL -o /tmp/toolchain.tar.xz "$TC"
+
+          # Do not assume the archive's internal layout. Extract, locate
+          # bin/clang, and treat its grandparent as the toolchain root. Handles
+          # both <root>/bin/clang and <root>/usr/bin/clang nesting.
+          rm -rf /tmp/tc
+          mkdir -p /tmp/tc
+          tar -xf /tmp/toolchain.tar.xz -C /tmp/tc
+          echo "--- archive layout ---"
+          find /tmp/tc -maxdepth 3 | head -n 40 || true
+          echo "----------------------"
+
+          # head closes the pipe, so guard against SIGPIPE tripping pipefail
+          CLANG=$(find /tmp/tc -path '*/bin/clang' \( -type f -o -type l \) | head -n1 || true)
+          if [ -z "$CLANG" ]; then
+            # Some builds ship only a versioned binary, e.g. bin/clang-13
+            CLANG=$(find /tmp/tc -path '*/bin/clang-*' \( -type f -o -type l \) | head -n1 || true)
+            if [ -n "$CLANG" ]; then
+              ln -sf "$(basename "$CLANG")" "$(dirname "$CLANG")/clang"
+              CLANG="$(dirname "$CLANG")/clang"
+              echo "Created clang symlink -> $CLANG"
+            fi
+          fi
+          if [ -z "$CLANG" ]; then
+            echo "::error::No clang found in the toolchain archive"
+            find /tmp/tc -maxdepth 5 | head -n 200 || true
+            exit 1
+          fi
+          TCROOT=$(dirname "$(dirname "$CLANG")")
+          echo "Toolchain root: $TCROOT"
+
+          mkdir -p "$THEOS/toolchain/linux/iphone"
+          tar -cf - -C "$TCROOT" . | tar -xf - -C "$THEOS/toolchain/linux/iphone"
+          rm -rf /tmp/tc /tmp/toolchain.tar.xz
+
+          # Pull exactly one iOS SDK instead of the whole multi-gigabyte repo
+          retry_clone /tmp/sdks --filter=blob:none --sparse --depth 1 \
+            https://github.com/theos/sdks.git
+          cd /tmp/sdks
+          SDK=$(git ls-tree --name-only HEAD | grep -E '^iPhoneOS1[5-9]\.[0-9]+\.sdk$' | sort -V | tail -1)
+          echo "Selected SDK: $SDK"
+          git sparse-checkout set "$SDK"
+          mkdir -p "$THEOS/sdks"
+          mv "/tmp/sdks/$SDK" "$THEOS/sdks/"
+          cd /
+          rm -rf /tmp/sdks
+
+      # Fails hard, so a broken or half-populated cache shows up here rather
+      # than as a confusing error mid-compile.
+      - name: Check toolchain
+        run: |
+          "$THEOS/toolchain/linux/iphone/bin/clang" --version
+          ls "$THEOS/sdks"
+          command -v ldid
+
+      - name: Build package
+        run: make package FINALPACKAGE=1
+
+      - name: Locate deb
+        id: deb
+        run: |
+          DEB=$(ls -1 packages/*.deb | head -n 1)
+          echo "name=$(basename "$DEB")" >> "$GITHUB_OUTPUT"
+          echo "Built $DEB"
+          dpkg-deb -I "$DEB" || true
+          dpkg-deb -c "$DEB" || true
+
+      # The Linux toolchain's arm64e slice crashes injected processes on iOS 17.0
+      # (NextUp3). The Makefile builds arm64 only; this guarantees no deb that
+      # carries an arm64e slice is ever uploaded or published.
+      - name: Verify slices (arm64 only, for iOS 17.0)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/debx
+          dpkg-deb -x "packages/${{ steps.deb.outputs.name }}" /tmp/debx
+          DYLIBS=$(find /tmp/debx -name '*.dylib')
+          if [ -z "$DYLIBS" ]; then
+            echo "::error::No dylib found in the deb"
+            exit 1
+          fi
+
+          # Reads the Mach-O header directly, so no lipo is needed on the runner.
+          cat > "$RUNNER_TEMP/check_archs.py" <<'PY'
+          import struct
+          import sys
+
+          CPU_TYPE_ARM64 = 0x0100000C
+          SUBTYPES = {0: "arm64", 1: "arm64v8", 2: "arm64e"}
+
+          def slices(data):
+              magic = struct.unpack_from(">I", data, 0)[0]
+              if magic in (0xCAFEBABE, 0xCAFEBABF):  # fat / fat64, big-endian
+                  count = struct.unpack_from(">I", data, 4)[0]
+                  stride = 20 if magic == 0xCAFEBABE else 32
+                  for i in range(count):
+                      yield struct.unpack_from(">II", data, 8 + i * stride)
+              elif struct.unpack_from("<I", data, 0)[0] == 0xFEEDFACF:  # thin 64-bit
+                  yield struct.unpack_from("<II", data, 4)
+              else:
+                  sys.exit(f"not a 64-bit Mach-O (magic {magic:#010x})")
+
+          def name(cputype, cpusubtype):
+              if cputype != CPU_TYPE_ARM64:
+                  return f"cputype {cputype:#x}"
+              # Low byte is the subtype; the high bits carry ptrauth ABI flags.
+              return SUBTYPES.get(cpusubtype & 0xFF, f"arm64 subtype {cpusubtype & 0xFF}")
+
+          path = sys.argv[1]
+          with open(path, "rb") as f:
+              data = f.read()
+          archs = [name(t, s) for t, s in slices(data)]
+          print(f"{path}: {' '.join(archs)}")
+          if archs != ["arm64"]:
+              sys.exit("expected exactly one arm64 slice; refusing to publish")
+          PY
+
+          for d in $DYLIBS; do
+            python3 "$RUNNER_TEMP/check_archs.py" "$d"
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.deb.outputs.name }}
+          path: packages/*.deb
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: NoFlashGPT (build ${{ github.run_number }})
+          body: Rootless arm64 build of NoFlashGPT for the ChatGPT app (com.openai.chat) on iOS 17.0.
+          files: packages/*.deb
