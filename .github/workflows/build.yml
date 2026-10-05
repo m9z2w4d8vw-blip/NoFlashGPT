@@ -4,10 +4,9 @@
 # Self-contained: this one file is everything CI needs, so it can be created
 # straight from the GitHub web editor at .github/workflows/.
 #
-# Same setup that ended up working for WhatAMess: ldid from Procursus (it is
-# not an apt package), a Linux toolchain matched to the runner's CPU and found
-# by locating clang rather than assuming the archive layout, one SDK pulled
-# sparsely, and retries on every network step.
+# Setup: ldid from Procursus (it is not an apt package), the Linux toolchain
+# matched to the runner's CPU and extracted into $THEOS/toolchain the way
+# Theos documents, one SDK pulled sparsely, and retries on every network step.
 name: Build and release
 
 on:
@@ -76,7 +75,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: theos
-          key: theos-ubuntu2204-v1
+          # Bumped after the toolchain-layout fix, so a Theos tree from the
+          # broken layout can never be restored.
+          key: theos-ubuntu2204-v2
 
       - name: Set up Theos
         if: steps.cache-theos.outputs.cache-hit != 'true'
@@ -119,38 +120,23 @@ jobs:
           echo "Toolchain: $TC"
           $CURL -o /tmp/toolchain.tar.xz "$TC"
 
-          # Do not assume the archive's internal layout. Extract, locate
-          # bin/clang, and treat its grandparent as the toolchain root. Handles
-          # both <root>/bin/clang and <root>/usr/bin/clang nesting.
-          rm -rf /tmp/tc
-          mkdir -p /tmp/tc
-          tar -xf /tmp/toolchain.tar.xz -C /tmp/tc
-          echo "--- archive layout ---"
-          find /tmp/tc -maxdepth 3 | head -n 40 || true
-          echo "----------------------"
+          # Extract straight into $THEOS/toolchain, which is how Theos's own Linux
+          # install docs set up this toolchain. The archive holds BOTH
+          # linux/iphone and linux/host, and the iphone tools resolve into the
+          # sibling host tree. Copying only linux/iphone (the previous version
+          # of this step) left bin/clang pointing at nothing.
+          mkdir -p "$THEOS/toolchain"
+          tar -xf /tmp/toolchain.tar.xz -C "$THEOS/toolchain"
+          rm -f /tmp/toolchain.tar.xz
 
-          # head closes the pipe, so guard against SIGPIPE tripping pipefail
-          CLANG=$(find /tmp/tc -path '*/bin/clang' \( -type f -o -type l \) | head -n1 || true)
-          if [ -z "$CLANG" ]; then
-            # Some builds ship only a versioned binary, e.g. bin/clang-13
-            CLANG=$(find /tmp/tc -path '*/bin/clang-*' \( -type f -o -type l \) | head -n1 || true)
-            if [ -n "$CLANG" ]; then
-              ln -sf "$(basename "$CLANG")" "$(dirname "$CLANG")/clang"
-              CLANG="$(dirname "$CLANG")/clang"
-              echo "Created clang symlink -> $CLANG"
-            fi
-          fi
-          if [ -z "$CLANG" ]; then
-            echo "::error::No clang found in the toolchain archive"
-            find /tmp/tc -maxdepth 5 | head -n 200 || true
-            exit 1
-          fi
-          TCROOT=$(dirname "$(dirname "$CLANG")")
-          echo "Toolchain root: $TCROOT"
+          echo "--- installed toolchain ---"
+          find "$THEOS/toolchain" -maxdepth 3 | head -n 40 || true
+          ls -l "$THEOS/toolchain/linux/iphone/bin/clang" || true
+          echo "clang resolves to: $(readlink -f "$THEOS/toolchain/linux/iphone/bin/clang" || true)"
+          echo "---------------------------"
 
-          mkdir -p "$THEOS/toolchain/linux/iphone"
-          tar -cf - -C "$TCROOT" . | tar -xf - -C "$THEOS/toolchain/linux/iphone"
-          rm -rf /tmp/tc /tmp/toolchain.tar.xz
+          # Fail here, with the cause on screen, rather than during compilation
+          "$THEOS/toolchain/linux/iphone/bin/clang" --version
 
           # Pull exactly one iOS SDK instead of the whole multi-gigabyte repo
           retry_clone /tmp/sdks --filter=blob:none --sparse --depth 1 \
