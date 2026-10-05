@@ -1,0 +1,9 @@
+Package: com.parv.noflashgpt
+Name: NoFlashGPT
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Keeps the ChatGPT app's camera flash and torch off.
+Maintainer: Parv
+Author: Parv
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
